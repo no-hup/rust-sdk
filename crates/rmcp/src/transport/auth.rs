@@ -848,6 +848,9 @@ impl WWWAuthenticateParams {
 pub struct OAuthClientConfig {
     pub client_id: String,
     pub client_secret: Option<String>,
+    /// RFC 7591 §3.2.1: seconds since the Unix epoch when `client_secret` expires.
+    /// `Some(0)` means the secret does not expire. `None` when the server omitted the field.
+    pub client_secret_expires_at: Option<u64>,
     pub scopes: Vec<String>,
     pub redirect_uri: String,
     pub application_type: Option<String>,
@@ -858,6 +861,7 @@ impl OAuthClientConfig {
         Self {
             client_id: client_id.into(),
             client_secret: None,
+            client_secret_expires_at: None,
             scopes: Vec::new(),
             redirect_uri: redirect_uri.into(),
             application_type: Some(DEFAULT_APPLICATION_TYPE.to_string()),
@@ -1286,6 +1290,10 @@ pub(crate) struct ClientRegistrationRequest {
 pub struct ClientRegistrationResponse {
     pub client_id: String,
     pub client_secret: Option<String>,
+    /// RFC 7591 §3.2.1. Required when `client_secret` is issued.
+    /// `Some(0)` means the secret does not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_expires_at: Option<u64>,
     pub client_name: Option<String>,
     pub redirect_uris: Vec<String>,
     // allow additional fields
@@ -1298,6 +1306,7 @@ impl ClientRegistrationResponse {
         Self {
             client_id: client_id.into(),
             client_secret: None,
+            client_secret_expires_at: None,
             client_name: None,
             redirect_uris,
             additional_fields: HashMap::new(),
@@ -2027,6 +2036,7 @@ impl AuthorizationManager {
             // we should treat it as no secret since otherwise we end up authenticating with a valid client_id with an empty client_secret
             // as a password, which is not a goal of the client secret.
             client_secret: reg_response.client_secret.filter(|s| !s.is_empty()),
+            client_secret_expires_at: reg_response.client_secret_expires_at,
             redirect_uri: redirect_uri.to_string(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             application_type,
@@ -2042,6 +2052,7 @@ impl AuthorizationManager {
         let config = OAuthClientConfig {
             client_id: client_id.to_string(),
             client_secret: None,
+            client_secret_expires_at: None,
             scopes: vec![],
             redirect_uri: self.base_url.to_string(),
             // keep the manager's current application_type
@@ -3927,6 +3938,7 @@ impl AuthorizationSession {
             OAuthClientConfig {
                 client_id: client_id.clone(),
                 client_secret: request.client_secret.clone(),
+                client_secret_expires_at: None,
                 scopes: scopes.clone(),
                 redirect_uri: redirect_uri.clone(),
                 application_type: request.application_type.clone(),
@@ -3949,6 +3961,7 @@ impl AuthorizationSession {
             OAuthClientConfig {
                 client_id: client_metadata_url.to_string(),
                 client_secret: None,
+                client_secret_expires_at: None,
                 scopes: scopes.clone(),
                 redirect_uri: redirect_uri.clone(),
                 application_type: Some(
@@ -7309,6 +7322,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn register_client_preserves_client_secret_expires_at() {
+        let client = RecordingOAuthHttpClient::with_responses(vec![
+            http_response(
+                201,
+                serde_json::json!({
+                    "client_id": "issued-client",
+                    "client_secret": "issued-secret",
+                    "client_secret_expires_at": 1_893_456_000u64,
+                    "redirect_uris": ["http://localhost/callback"]
+                }),
+            ),
+            http_response(
+                201,
+                serde_json::json!({
+                    "client_id": "never-expires",
+                    "client_secret": "long-lived",
+                    "client_secret_expires_at": 0,
+                    "redirect_uris": ["http://localhost/callback"]
+                }),
+            ),
+            http_response(
+                201,
+                serde_json::json!({
+                    "client_id": "public-client",
+                    "redirect_uris": ["http://localhost/callback"]
+                }),
+            ),
+        ]);
+        let mut manager = AuthorizationManager::new_with_oauth_http_client(
+            "https://mcp.example.com/mcp",
+            Arc::new(client),
+        )
+        .await
+        .unwrap();
+        manager.set_metadata(AuthorizationMetadata {
+            authorization_endpoint: "https://auth.example.com/authorize".to_string(),
+            token_endpoint: "https://auth.example.com/token".to_string(),
+            registration_endpoint: Some("https://auth.example.com/register".to_string()),
+            response_types_supported: Some(vec!["code".to_string()]),
+            ..Default::default()
+        });
+
+        let issued = manager
+            .register_client("Codex", "http://localhost/callback", &[])
+            .await
+            .unwrap();
+        assert_eq!(issued.client_secret.as_deref(), Some("issued-secret"));
+        assert_eq!(issued.client_secret_expires_at, Some(1_893_456_000));
+
+        // RFC 7591: 0 means the secret does not expire, and must not be dropped.
+        let never = manager
+            .register_client("Codex", "http://localhost/callback", &[])
+            .await
+            .unwrap();
+        assert_eq!(never.client_secret_expires_at, Some(0));
+
+        let public_client = manager
+            .register_client("Codex", "http://localhost/callback", &[])
+            .await
+            .unwrap();
+        assert_eq!(public_client.client_secret, None);
+        assert_eq!(public_client.client_secret_expires_at, None);
+    }
+
     // -- url helpers --
 
     #[test]
@@ -8023,6 +8101,7 @@ mod tests {
         OAuthClientConfig {
             client_id: "my-client".to_string(),
             client_secret: Some("my-secret".to_string()),
+            client_secret_expires_at: None,
             scopes: vec![],
             redirect_uri: "http://localhost/callback".to_string(),
             application_type: None,
